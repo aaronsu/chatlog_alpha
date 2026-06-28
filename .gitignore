@@ -92,3 +92,5 @@ tmpclaude-*/
 # Test files
 sns.md
 .claude/settings.local.json
+.codegraph
+.serena

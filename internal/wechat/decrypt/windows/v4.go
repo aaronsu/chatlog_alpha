@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/sha512"
 	"encoding/hex"
 	"hash"
 	"io"
 	"os"
+
+	"golang.org/x/crypto/pbkdf2"
 
 	"github.com/sjzar/chatlog/internal/errors"
 	"github.com/sjzar/chatlog/internal/wechat/decrypt/common"
@@ -88,11 +91,13 @@ func (d *V4Decryptor) Validate(page1 []byte, key []byte) bool {
 	if len(page1) < PageSize || len(key) != common.KeySize {
 		return false
 	}
-	dec, err := decryptPage(page1[:PageSize], key, 1)
-	if err != nil || len(dec) < len(common.SQLiteHeader) {
-		return false
-	}
-	return string(dec[:len(common.SQLiteHeader)]) == common.SQLiteHeader
+	return common.ValidateKey(page1[:PageSize], key, page1[:SaltSize], sha512.New, 64, ReserveSize, PageSize, func(key []byte, salt []byte) ([]byte, []byte) {
+		encKey, macKey, err := d.DeriveKeys(key, salt)
+		if err != nil {
+			return nil, nil
+		}
+		return encKey, macKey
+	})
 }
 
 func (d *V4Decryptor) GetPageSize() int {
@@ -108,17 +113,21 @@ func (d *V4Decryptor) GetHMACSize() int {
 }
 
 func (d *V4Decryptor) GetHashFunc() func() hash.Hash {
-	return nil
+	return sha512.New
 }
 
 func (d *V4Decryptor) DeriveKeys(key []byte, salt []byte) ([]byte, []byte, error) {
-	_ = salt
 	if len(key) != common.KeySize {
 		return nil, nil, errors.ErrKeyLengthMust32
 	}
 	enc := make([]byte, len(key))
 	copy(enc, key)
-	return enc, nil, nil
+	macSalt := make([]byte, len(salt))
+	for i, b := range salt {
+		macSalt[i] = b ^ 0x3A
+	}
+	macKey := pbkdf2.Key(enc, macSalt, 2, common.KeySize, sha512.New)
+	return enc, macKey, nil
 }
 
 func (d *V4Decryptor) GetVersion() string {

@@ -22,7 +22,6 @@ import (
 	"github.com/shirou/gopsutil/v4/process"
 	"golang.org/x/sys/windows"
 
-	"github.com/sjzar/chatlog/internal/wechat/decrypt"
 	"github.com/sjzar/chatlog/internal/wechat/decrypt/common"
 	"github.com/sjzar/chatlog/internal/wechat/model"
 	"github.com/sjzar/chatlog/pkg/util/dat2img"
@@ -41,6 +40,9 @@ type keyFileEntry struct {
 type dbSaltEntry struct {
 	SaltHex string
 	DBRel   string
+	Path    string
+	Salt    []byte
+	Page1   []byte
 }
 
 type keySaltPair struct {
@@ -415,26 +417,54 @@ func InitAllKeysByPID(pid uint32, dataDir string, status func(string)) (string, 
 	if err != nil {
 		return "", 0, err
 	}
-	if len(pairs) == 0 {
-		return "", 0, fmt.Errorf("内存扫描未发现候选 key/salt")
-	}
 	if status != nil {
 		status(fmt.Sprintf("内存扫描完成：候选 key/salt %d 组", len(pairs)))
 	}
 
-	out := map[string]keyFileEntry{}
-	for _, pair := range pairs {
-		for _, ds := range dbSalts {
-			if pair.SaltHex != ds.SaltHex {
-				continue
-			}
-			if _, exists := out[ds.DBRel]; !exists {
-				out[ds.DBRel] = keyFileEntry{EncKey: strings.ToLower(pair.KeyHex)}
-			}
+	out := keyMapFromPairs(pairs, dbSalts)
+	if len(out) == 0 {
+		if status != nil {
+			status("旧 key/salt 扫描未得到可验证密钥，尝试新版 passphrase 捕获...")
+		}
+		out, err = scanPassphraseKeysByPID(pid, dbSalts, status)
+		if err != nil {
+			return "", 0, err
 		}
 	}
+
+	return writeAllKeysAndPick(accountDir, out, status)
+}
+
+func InitAllKeysByPIDPassphrase(pid uint32, dataDir string, status func(string)) (string, int, error) {
+	if pid == 0 {
+		return "", 0, fmt.Errorf("invalid pid")
+	}
+	if dataDir == "" {
+		return "", 0, fmt.Errorf("invalid dataDir")
+	}
+
+	accountDir, dbStorageDir := resolveDBDirs(dataDir)
+	dbSalts, err := collectDBSalts(dbStorageDir)
+	if err != nil {
+		return "", 0, err
+	}
+	if len(dbSalts) == 0 {
+		return "", 0, fmt.Errorf("未找到可用加密数据库（db_storage）")
+	}
+	if status != nil {
+		status(fmt.Sprintf("已收集加密数据库 salt：%d 个", len(dbSalts)))
+		status("尝试新版 passphrase 捕获...")
+	}
+	out, err := scanPassphraseKeysByPID(pid, dbSalts, status)
+	if err != nil {
+		return "", 0, err
+	}
+	return writeAllKeysAndPick(accountDir, out, status)
+}
+
+func writeAllKeysAndPick(accountDir string, out map[string]keyFileEntry, status func(string)) (string, int, error) {
 	if len(out) == 0 {
-		return "", 0, fmt.Errorf("扫描到候选 key，但未匹配到任意数据库 salt")
+		return "", 0, fmt.Errorf("未派生出可验证数据库密钥")
 	}
 
 	keysPath := filepath.Join(accountDir, "all_keys.json")
@@ -597,15 +627,11 @@ func validateKeyOnDBPath(dataDir, dbRelPath, keyHex string) bool {
 		return false
 	}
 	dbPath := resolveDBPath(dataDir, dbRelPath)
-	dbInfo, err := common.OpenDBFile(dbPath, 4096)
+	dbInfo, err := common.OpenDBFile(dbPath, v4PageSize)
 	if err != nil {
 		return false
 	}
-	d, err := decrypt.NewDecryptor(model.PlatformWindows, 4)
-	if err != nil {
-		return false
-	}
-	return d.Validate(dbInfo.FirstPage, keyBytes)
+	return validateV4DBKey(keyBytes, dbInfo.FirstPage)
 }
 
 func resolveDBDirs(dataDir string) (accountDir string, dbStorageDir string) {
@@ -645,7 +671,7 @@ func collectDBSalts(dbStorageDir string) ([]dbSaltEntry, error) {
 		if !strings.HasSuffix(strings.ToLower(path), ".db") {
 			return nil
 		}
-		salt, ok := readDBSalt(path)
+		salt, page1, ok := readDBSalt(path)
 		if !ok {
 			return nil
 		}
@@ -653,7 +679,13 @@ func collectDBSalts(dbStorageDir string) ([]dbSaltEntry, error) {
 		if err != nil {
 			return nil
 		}
-		out = append(out, dbSaltEntry{SaltHex: salt, DBRel: normalizePath(rel)})
+		out = append(out, dbSaltEntry{
+			SaltHex: salt,
+			DBRel:   normalizePath(rel),
+			Path:    path,
+			Salt:    append([]byte(nil), page1[:common.SaltSize]...),
+			Page1:   page1,
+		})
 		return nil
 	})
 	if err != nil {
@@ -662,20 +694,20 @@ func collectDBSalts(dbStorageDir string) ([]dbSaltEntry, error) {
 	return out, nil
 }
 
-func readDBSalt(path string) (string, bool) {
+func readDBSalt(path string) (string, []byte, bool) {
 	f, err := os.Open(path)
 	if err != nil {
-		return "", false
+		return "", nil, false
 	}
 	defer f.Close()
-	buf := make([]byte, 16)
+	buf := make([]byte, v4PageSize)
 	if _, err := io.ReadFull(f, buf); err != nil {
-		return "", false
+		return "", nil, false
 	}
 	if string(buf[:15]) == "SQLite format 3" {
-		return "", false
+		return "", nil, false
 	}
-	return strings.ToLower(hex.EncodeToString(buf)), true
+	return strings.ToLower(hex.EncodeToString(buf[:common.SaltSize])), buf, true
 }
 
 func scanKeySaltPairsByPID(pid uint32) ([]keySaltPair, error) {
